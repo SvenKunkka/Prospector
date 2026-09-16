@@ -1,0 +1,1065 @@
+diff --git a/keyboards/keychron/common/prospector/prospector.mk b/keyboards/keychron/common/prospector/prospector.mk
+new file mode 100644
+index 0000000..8d927b9
+--- /dev/null
++++ b/keyboards/keychron/common/prospector/prospector.mk
+@@ -0,0 +1,62 @@
++# Copyright 2026 Keychron
++# SPDX-License-Identifier: GPL-2.0-or-later
++#
++# Prospector status module — build integration.
++#
++# Enable from a keymap's rules.mk:
++#
++#     PROSPECTOR_ENABLE = yes
++#     include keyboards/keychron/common/prospector/prospector.mk
++#
++# With PROSPECTOR_ENABLE unset nothing is compiled and the keyboard behaves
++# exactly as stock.
++#
++# Transport (see prospector_transport.h for what each one can and cannot do):
++#     PROSPECTOR_TRANSPORT = none     (default) count frames, send nothing
++#     PROSPECTOR_TRANSPORT = rawhid   Keychron raw HID — works over USB and
++#                                     Bluetooth; used to verify the pipeline
++#     PROSPECTOR_TRANSPORT = uart     hand frames to an external BLE radio;
++#                                     also set PROSPECTOR_UART_DRIVER (e.g. SD6)
++#                                     and enable that USART in mcuconf.h/halconf.h
++#
++# Debug logging on the QMK/Keychron console:
++#     PROSPECTOR_DEBUG = yes
++
++ifeq ($(strip $(PROSPECTOR_ENABLE)), yes)
++
++PROSPECTOR_DIR = $(TOP_DIR)/keyboards/keychron/common/prospector
++
++# QMK turns VPATH entries into include dirs as well (builddefs/build_keyboard.mk),
++# which is how the stock keymaps reach e.g. "keychron_common.h".
++VPATH += $(PROSPECTOR_DIR)
++
++SRC += \
++    $(PROSPECTOR_DIR)/prospector_status.c \
++    $(PROSPECTOR_DIR)/prospector_qmk.c \
++    $(PROSPECTOR_DIR)/prospector_transport.c
++
++OPT_DEFS += -DPROSPECTOR_ENABLE
++OPT_DEFS += -DPROSPECTOR_USE_KEYCHRON_BATTERY
++
++# --- transport selection -----------------------------------------------------
++PROSPECTOR_TRANSPORT ?= none
++ifeq ($(strip $(PROSPECTOR_TRANSPORT)), rawhid)
++    OPT_DEFS += -DPROSPECTOR_TRANSPORT_RAWHID
++else ifeq ($(strip $(PROSPECTOR_TRANSPORT)), uart)
++    ifeq ($(strip $(PROSPECTOR_UART_DRIVER)),)
++        $(error PROSPECTOR_TRANSPORT=uart requires PROSPECTOR_UART_DRIVER, e.g. PROSPECTOR_UART_DRIVER=SD6)
++    endif
++    OPT_DEFS += -DPROSPECTOR_TRANSPORT_UART
++    OPT_DEFS += -DPROSPECTOR_UART_DRIVER=$(strip $(PROSPECTOR_UART_DRIVER))
++    ifneq ($(strip $(PROSPECTOR_UART_BAUD)),)
++        OPT_DEFS += -DPROSPECTOR_UART_BAUD=$(strip $(PROSPECTOR_UART_BAUD))
++    endif
++endif
++
++# --- optional debug console --------------------------------------------------
++ifeq ($(strip $(PROSPECTOR_DEBUG)), yes)
++    OPT_DEFS += -DPROSPECTOR_DEBUG
++    CONSOLE_ENABLE = yes
++endif
++
++endif # PROSPECTOR_ENABLE
+diff --git a/keyboards/keychron/common/prospector/prospector_qmk.c b/keyboards/keychron/common/prospector/prospector_qmk.c
+new file mode 100644
+index 0000000..6c2f4d1
+--- /dev/null
++++ b/keyboards/keychron/common/prospector/prospector_qmk.c
+@@ -0,0 +1,260 @@
++/* Copyright 2026 Keychron
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Prospector status — state collection and broadcast scheduling.
++ *
++ * The policy is the one the reference ZMK module uses (prospector-zmk-module
++ * v2.2.3, src/status_advertisement.c), so a scanner behaves the same whether it
++ * is looking at a ZMK keyboard or at this one:
++ *
++ *   - 5 x 15 ms burst at boot and on layer / modifier / profile change,
++ *     so a single lost advertisement does not lose the state change;
++ *   - 1000 ms while the user is typing (WPM and battery refresh);
++ *   - 30000 ms once 5000 ms have passed with no input.
++ *
++ * Everything is timer-driven from the keyboard's task hook. No wait_ms(), no
++ * blocking, no work in the matrix scan path.
++ */
++
++#include "quantum.h"
++#include "prospector_status.h"
++#include "prospector_qmk.h"
++#include "prospector_transport.h"
++
++#ifdef PROSPECTOR_ENABLE
++
++#    include <string.h>
++
++#    include "wireless.h"
++#    include "transport.h"
++#    include "lpm.h" /* usb_power_connected() */
++#    ifdef PROSPECTOR_USE_KEYCHRON_BATTERY
++#        include "battery.h"
++#    endif
++
++/* --------------------------------------------------------------- policy --- */
++#    ifndef PROSPECTOR_INTERVAL_ACTIVE_MS
++#        define PROSPECTOR_INTERVAL_ACTIVE_MS 1000
++#    endif
++#    ifndef PROSPECTOR_INTERVAL_IDLE_MS
++#        define PROSPECTOR_INTERVAL_IDLE_MS 30000
++#    endif
++#    ifndef PROSPECTOR_IDLE_THRESHOLD_MS
++#        define PROSPECTOR_IDLE_THRESHOLD_MS 5000
++#    endif
++#    ifndef PROSPECTOR_BURST_COUNT
++#        define PROSPECTOR_BURST_COUNT 5
++#    endif
++#    ifndef PROSPECTOR_BURST_INTERVAL_MS
++#        define PROSPECTOR_BURST_INTERVAL_MS 15
++#    endif
++#    ifndef PROSPECTOR_CHANNEL_DEFAULT
++#        define PROSPECTOR_CHANNEL_DEFAULT PROSPECTOR_CHANNEL_ALL
++#    endif
++
++/* ---------------------------------------------------------------- debug --- */
++#    if defined(PROSPECTOR_DEBUG) && (defined(LK_WIRELESS_ENABLE) || defined(KC_BLUETOOTH_ENABLE))
++#        define PROSPECTOR_LOG(...) kc_printf(__VA_ARGS__)
++#    else
++#        define PROSPECTOR_LOG(...)             do {                    \
++            } while (0)
++#    endif
++
++/* ---------------------------------------------------------------- stats --- */
++static uint32_t frames_encoded;
++static uint32_t bursts;
++
++uint32_t prospector_status_frames_encoded(void) { return frames_encoded; }
++uint32_t prospector_status_frames_sent(void) { return prospector_transport_frames_out(); }
++uint32_t prospector_status_frames_dropped(void) { return prospector_transport_frames_dropped(); }
++uint32_t prospector_status_bursts(void) { return bursts; }
++
++/* ------------------------------------------------------------ last frame -- */
++static uint8_t last_frame[PROSPECTOR_ADV_SIZE];
++static bool    have_frame;
++
++size_t prospector_status_get_frame(uint8_t *out, size_t len) {
++    if (!have_frame || out == NULL || len < PROSPECTOR_ADV_SIZE) return 0;
++    memcpy(out, last_frame, PROSPECTOR_ADV_SIZE);
++    return PROSPECTOR_ADV_SIZE;
++}
++
++/* ---------------------------------------------------------------- state --- */
++static uint32_t last_send_ms;
++static uint32_t next_burst_ms;
++static uint8_t  burst_remaining;
++static uint8_t  prev_layer = 0xFF;
++static uint8_t  prev_mods  = 0xFF;
++static uint8_t  prev_prof  = 0xFF;
++
++static uint8_t current_layer(void) {
++    return (uint8_t)(get_highest_layer(layer_state | default_layer_state) & 0x0F);
++}
++
++/* Bluetooth profile slot is meaningful only in Bluetooth mode. A wired or
++ * 2.4 GHz link has no profile slot, so report 0 (none). */
++static uint8_t current_profile(void) {
++    return (get_transport() == TRANSPORT_BLUETOOTH) ? (wireless_get_host_index() & 0x07) : 0;
++}
++
++static uint8_t compose_status_flags(void) {
++    uint8_t flags = 0;
++    transport_t t = get_transport();
++
++    /* "USB connected" mirrors ZMK's zmk_usb_is_powered(): the VBUS sense pin.
++     * "USB HID ready" additionally requires USB to be the active transport. */
++    if (usb_power_connected()) flags |= PROSPECTOR_FLAG_USB_CONNECTED;
++    if (t == TRANSPORT_USB) flags |= PROSPECTOR_FLAG_USB_HID_READY;
++
++    /* Charging: the same charger status pin the battery code samples. */
++#    if defined(BAT_CHARGING_PIN) && defined(BAT_CHARGING_LEVEL)
++    if (usb_power_connected() && gpio_read_pin(BAT_CHARGING_PIN) == BAT_CHARGING_LEVEL) {
++        flags |= PROSPECTOR_FLAG_CHARGING;
++    }
++#    endif
++
++    if (t & TRANSPORT_WIRELESS) {
++        if (wireless_get_state() == WT_CONNECTED) {
++            flags |= PROSPECTOR_FLAG_BLE_CONNECTED;
++            /* A working link means the peer is bonded; the module exposes no
++             * separate bonded-but-idle signal. */
++            if (t == TRANSPORT_BLUETOOTH) flags |= PROSPECTOR_FLAG_BLE_BONDED;
++        }
++    }
++
++#    ifdef CAPS_WORD_ENABLE
++    if (is_caps_word_on()) flags |= PROSPECTOR_FLAG_CAPS_WORD;
++#    endif
++
++    return flags;
++}
++
++/* The K10 Max is a single-link keyboard (one active host at a time) and the
++ * module does not report a link count, so this is derived from verified
++ * transport state rather than invented. */
++static uint8_t compose_connection_count(void) {
++    if ((get_transport() & TRANSPORT_WIRELESS) && wireless_get_state() == WT_CONNECTED) return 1;
++    return 0;
++}
++
++/* Transport-private carrier byte. Host lock state has no field in the v2.2.3
++ * wire format, so it travels beside the protocol frame, not inside it. */
++static uint8_t compose_aux(void) {
++    uint8_t aux = 0;
++    led_t   leds = host_keyboard_led_state();
++
++    if (leds.caps_lock) aux |= (1u << 0);
++    if (leds.num_lock) aux |= (1u << 1);
++    if (leds.scroll_lock) aux |= (1u << 2);
++
++    return aux;
++}
++
++static void collect(struct prospector_state *st) {
++    memset(st, 0, sizeof(*st));
++
++    st->active_layer     = current_layer();
++    st->modifier_flags   = get_mods();
++    st->status_flags     = compose_status_flags();
++    st->connection_count = compose_connection_count();
++    st->channel          = PROSPECTOR_CHANNEL_DEFAULT;
++    st->profile_slot     = current_profile();
++
++#    ifdef PROSPECTOR_USE_KEYCHRON_BATTERY
++    {
++        uint8_t pct       = battery_get_percentage();
++        st->battery_level = pct;
++        st->battery_known = (pct <= 100);
++    }
++#    endif
++
++#    ifdef WPM_ENABLE
++    st->wpm = get_current_wpm();
++#    endif
++
++    /* QMK has no layer-name table on this board, so the encoder emits the
++     * truthful "L<n>" rather than a guessed label. */
++    st->layer_name = NULL;
++
++#    ifdef UID_BASE
++    {
++        uint32_t uid       = *(volatile uint32_t *)UID_BASE;
++        st->keyboard_id[0] = (uint8_t)(uid & 0xFF);
++        st->keyboard_id[1] = (uint8_t)((uid >> 8) & 0xFF);
++        st->keyboard_id[2] = (uint8_t)((uid >> 16) & 0xFF);
++        st->keyboard_id[3] = (uint8_t)((uid >> 24) & 0xFF);
++    }
++#    endif
++}
++
++static void send_now(void) {
++    struct prospector_state    st;
++    struct prospector_adv_data adv;
++
++    collect(&st);
++    prospector_encode(&st, &adv);
++    frames_encoded++;
++
++    memcpy(last_frame, &adv, PROSPECTOR_ADV_SIZE);
++    have_frame = true;
++
++    prospector_transport_send(last_frame, PROSPECTOR_ADV_SIZE, compose_aux());
++
++#    ifdef PROSPECTOR_DEBUG
++    {
++        char dump[128];
++        prospector_format(&adv, dump, sizeof(dump));
++        PROSPECTOR_LOG("[Prospector] %s bat=%u(%s) layer=%u mods=0x%02X wpm=%u flags=0x%02X -> %s\n",
++                       dump, adv.battery_level, st.battery_known ? "measured" : "unknown",
++                       adv.active_layer, adv.modifier_flags, adv.wpm_value, adv.status_flags,
++                       prospector_transport_name());
++    }
++#    endif
++
++    last_send_ms = timer_read32();
++}
++
++/* --------------------------------------------------------------- public --- */
++void prospector_status_init(void) {
++    last_send_ms    = 0;
++    burst_remaining = PROSPECTOR_BURST_COUNT; /* burst on boot, as the ZMK module does */
++    next_burst_ms   = timer_read32();
++
++    prospector_transport_init();
++
++    PROSPECTOR_LOG("[Prospector] init, transport=%s\n", prospector_transport_name());
++}
++
++void prospector_status_task(void) {
++    uint32_t now = timer_read32();
++
++    /* Bursts first: a state change must not wait for the periodic tick. */
++    uint8_t layer = current_layer();
++    if (layer != prev_layer || get_mods() != prev_mods || current_profile() != prev_prof) {
++        bool already = (burst_remaining > 0);
++        prev_layer   = layer;
++        prev_mods    = get_mods();
++        prev_prof    = current_profile();
++        if (!already) bursts++;
++        burst_remaining = PROSPECTOR_BURST_COUNT;
++        next_burst_ms   = now;
++
++        PROSPECTOR_LOG("[Prospector] change -> burst (layer=%u)\n", layer);
++    }
++
++    if (burst_remaining > 0) {
++        if ((int32_t)(now - next_burst_ms) >= 0) {
++            send_now();
++            burst_remaining--;
++            next_burst_ms = now + PROSPECTOR_BURST_INTERVAL_MS;
++        }
++        return;
++    }
++
++    bool     idle     = last_input_activity_elapsed() >= PROSPECTOR_IDLE_THRESHOLD_MS;
++    uint32_t interval = idle ? PROSPECTOR_INTERVAL_IDLE_MS : PROSPECTOR_INTERVAL_ACTIVE_MS;
++
++    if (timer_elapsed32(last_send_ms) >= interval) send_now();
++}
++
++#endif /* PROSPECTOR_ENABLE */
+diff --git a/keyboards/keychron/common/prospector/prospector_qmk.h b/keyboards/keychron/common/prospector/prospector_qmk.h
+new file mode 100644
+index 0000000..c6af194
+--- /dev/null
++++ b/keyboards/keychron/common/prospector/prospector_qmk.h
+@@ -0,0 +1,48 @@
++/* Copyright 2026 Keychron
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Prospector status — QMK glue.
++ *
++ * Layering (each layer only knows the one below it):
++ *
++ *     QMK state            layer_state, mods, battery, transport, LED state
++ *         |
++ *     prospector_qmk.c     collects state, applies the broadcast policy
++ *         |
++ *     prospector_status.c  pure encoder -> 26-byte Prospector frame
++ *         |
++ *     prospector_transport.c  the only layer that touches a wire
++ *
++ * Nothing here blocks the main loop: the scheduler is driven from
++ * keychron_task_kb() and every step is a bounded timer comparison plus one
++ * non-blocking transport call.
++ */
++
++#pragma once
++
++#include "prospector_status.h"
++
++#ifdef PROSPECTOR_ENABLE
++
++#    include <stdint.h>
++#    include <stddef.h>
++
++/* Call once from the keyboard's keyboard_post_init_kb(). */
++void prospector_status_init(void);
++
++/* Call from the keyboard's periodic task hook. Applies the reference broadcast
++ * policy (boot burst, change burst, 1 Hz active, 30 s idle). */
++void prospector_status_task(void);
++
++/* Copy the most recent encoded 26-byte frame out. Returns bytes copied, or 0 if
++ * no frame has been produced yet. Lets an external radio pull the current frame
++ * without going through prospector_transport.c. */
++size_t prospector_status_get_frame(uint8_t *out, size_t len);
++
++/* Diagnostics. */
++uint32_t prospector_status_frames_encoded(void);
++uint32_t prospector_status_frames_sent(void);
++uint32_t prospector_status_frames_dropped(void);
++uint32_t prospector_status_bursts(void);
++
++#endif /* PROSPECTOR_ENABLE */
+diff --git a/keyboards/keychron/common/prospector/prospector_status.c b/keyboards/keychron/common/prospector/prospector_status.c
+new file mode 100644
+index 0000000..1d6aa15
+--- /dev/null
++++ b/keyboards/keychron/common/prospector/prospector_status.c
+@@ -0,0 +1,92 @@
++/* Copyright 2026 Keychron
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Prospector status encoder — implementation. See prospector_status.h.
++ */
++
++#include "prospector_status.h"
++
++#include <string.h>
++#include <stdio.h>
++
++static void put_layer_label(char *dst, uint8_t layer, const char *name) {
++    /* The wire field is exactly 4 bytes and is explicitly NOT NUL-terminated
++     * (see the reference: "4 bytes, NOT null-terminated, full 4 chars usable").
++     * A label shorter than 4 chars is therefore zero-padded, matching the
++     * reference's memset(0)+memcpy. A receiver reads it with %.4s. */
++    memset(dst, 0, 4);
++
++    if (name && name[0]) {
++        for (size_t i = 0; i < 4 && name[i]; i++) {
++            dst[i] = name[i];
++        }
++        return;
++    }
++
++    /* No label available: emit the layer index truthfully as "L<n>" rather
++     * than inventing a name. Layers 0-9 match the reference exactly. */
++    dst[0] = 'L';
++    if (layer >= 10) {
++        dst[1] = '1';
++        dst[2] = (char)('0' + (layer - 10));
++    } else {
++        dst[1] = (char)('0' + layer);
++    }
++}
++
++size_t prospector_encode(const struct prospector_state *state,
++                         struct prospector_adv_data     *out) {
++    memset(out, 0, sizeof(*out));
++
++    out->manufacturer_id[0] = PROSPECTOR_MANUFACTURER_ID_0;
++    out->manufacturer_id[1] = PROSPECTOR_MANUFACTURER_ID_1;
++    out->service_uuid[0]    = PROSPECTOR_SERVICE_UUID_0;
++    out->service_uuid[1]    = PROSPECTOR_SERVICE_UUID_1;
++
++    out->version       = PROSPECTOR_VERSION_BYTE;
++    out->active_layer  = (uint8_t)(state->active_layer & 0x0F);
++    out->profile_slot  = PROSPECTOR_PROFILE_SLOT_BYTE(state->profile_slot & 0x07);
++    out->status_flags  = state->status_flags;
++    out->modifier_flags = state->modifier_flags;
++
++    /* Battery: 0-100 when measured. If the gauge has no reading yet we send 0
++     * and clear the charging bit's meaning is left to status_flags; we do NOT
++     * substitute a nominal value. */
++    out->battery_level = state->battery_known ? (uint8_t)(state->battery_level > 100 ? 100 : state->battery_level) : 0;
++
++    /* Standalone keyboard: role 0, index 0, no split peripherals.
++     * peripheral_battery[] stays 0, which the protocol defines as "N/A". */
++    out->device_role  = PROSPECTOR_ROLE_STANDALONE;
++    out->device_index = 0;
++    /* peripheral_battery already zero from memset -> protocol "N/A" */
++
++    put_layer_label(out->layer_name, out->active_layer, state->layer_name);
++
++    for (size_t i = 0; i < 4; i++) {
++        out->keyboard_id[i] = state->keyboard_id[i];
++    }
++
++    /* wpm: 0 means inactive/unknown per protocol — passed through unchanged. */
++    out->wpm_value = state->wpm;
++
++    out->channel          = state->channel;
++    out->connection_count = state->connection_count > 5 ? 5 : state->connection_count;
++
++    return sizeof(*out);
++}
++
++void prospector_format(const struct prospector_adv_data *data, char *buf, size_t len) {
++    if (!buf || len == 0) return;
++
++    snprintf(buf, len,
++             "ver=%u.%u.%u bat=%u%% layer=%u prof=%u conn=%u flags=0x%02X "
++             "role=%u mods=0x%02X wpm=%u ch=%u name=%.4s id=%02X%02X%02X%02X",
++             (data->version >> 4) & 0x0F, data->version & 0x0F,
++             (data->profile_slot >> 3) & 0x07,
++             data->battery_level, data->active_layer,
++             data->profile_slot & 0x07, data->connection_count,
++             data->status_flags, data->device_role, data->modifier_flags,
++             data->wpm_value, data->channel, data->layer_name,
++             data->keyboard_id[0], data->keyboard_id[1],
++             data->keyboard_id[2], data->keyboard_id[3]);
++}
+diff --git a/keyboards/keychron/common/prospector/prospector_status.h b/keyboards/keychron/common/prospector/prospector_status.h
+new file mode 100644
+index 0000000..2b50999
+--- /dev/null
++++ b/keyboards/keychron/common/prospector/prospector_status.h
+@@ -0,0 +1,133 @@
++/* Copyright 2026 Keychron
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Prospector status encoder — keyboard side.
++ *
++ * Produces the 26-byte manufacturer-specific advertisement payload defined by
++ * the Prospector Scanner protocol, exactly as `struct zmk_status_adv_data`
++ * in t-ogura/prospector-zmk-module v2.2.3 (include/zmk/status_advertisement.h).
++ *
++ * This file is deliberately free of QMK and hardware dependencies so it can be
++ * unit-tested on the host against the reference struct.
++ *
++ * IMPORTANT — the K10 Max cannot transmit this payload by itself. The BLE
++ * radio (and therefore the advertisement) is owned by the LKBT51 wireless
++ * module, whose command interface exposes no advertising control. See
++ * docs/BLOCKER.md. This encoder builds the frame; a radio that can transmit
++ * it is still required.
++ */
++
++#pragma once
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define PROSPECTOR_ADV_SIZE 26
++
++/* Manufacturer ID 0xFFFF == "no company assigned / local use", as the
++ * Prospector protocol specifies (NOT a SIG company identifier). */
++#define PROSPECTOR_MANUFACTURER_ID_0 0xFF
++#define PROSPECTOR_MANUFACTURER_ID_1 0xFF
++#define PROSPECTOR_SERVICE_UUID_0    0xAB
++#define PROSPECTOR_SERVICE_UUID_1    0xCD
++
++/* Protocol/module version we implement: v2.2.3.
++ * The scanner rejects/annotates major == 0 as "< v2.2". */
++#define PROSPECTOR_MODULE_MAJOR 2
++#define PROSPECTOR_MODULE_MINOR 2
++#define PROSPECTOR_MODULE_PATCH 3
++#define PROSPECTOR_MODULE_DEV   0
++
++#define PROSPECTOR_VERSION_BYTE \
++    ((uint8_t)((PROSPECTOR_MODULE_MAJOR << 4) | (PROSPECTOR_MODULE_MINOR & 0x0F)))
++
++#define PROSPECTOR_PROFILE_SLOT_BYTE(profile)                              \
++    ((uint8_t)((((PROSPECTOR_MODULE_DEV) & 0x01) << 6) |                  \
++               (((PROSPECTOR_MODULE_PATCH) & 0x07) << 3) |                 \
++               ((profile) & 0x07)))
++
++/* status_flags bits (payload offset 9) */
++#define PROSPECTOR_FLAG_CAPS_WORD     (1u << 0)
++#define PROSPECTOR_FLAG_CHARGING      (1u << 1)
++#define PROSPECTOR_FLAG_USB_CONNECTED (1u << 2)
++#define PROSPECTOR_FLAG_USB_HID_READY (1u << 3)
++#define PROSPECTOR_FLAG_BLE_CONNECTED (1u << 4)
++#define PROSPECTOR_FLAG_BLE_BONDED    (1u << 5)
++
++/* modifier_flags bits (payload offset 23) — each bit is one HID modifier */
++#define PROSPECTOR_MOD_LCTL (1u << 0)
++#define PROSPECTOR_MOD_LSFT (1u << 1)
++#define PROSPECTOR_MOD_LALT (1u << 2)
++#define PROSPECTOR_MOD_LGUI (1u << 3)
++#define PROSPECTOR_MOD_RCTL (1u << 4)
++#define PROSPECTOR_MOD_RSFT (1u << 5)
++#define PROSPECTOR_MOD_RALT (1u << 6)
++#define PROSPECTOR_MOD_RGUI (1u << 7)
++
++/* device_role (payload offset 10) */
++#define PROSPECTOR_ROLE_STANDALONE 0
++#define PROSPECTOR_ROLE_CENTRAL    1
++#define PROSPECTOR_ROLE_PERIPHERAL 2
++
++/* "value not obtainable / not applicable" sentinels defined by the protocol */
++#define PROSPECTOR_BATTERY_NONE  0    /* peripheral_battery[]: 0 == N/A       */
++#define PROSPECTOR_WPM_INACTIVE  0    /* wpm_value: 0 == inactive/unknown      */
++#define PROSPECTOR_CHANNEL_ALL   0    /* channel: 0 == accept all / broadcast  */
++
++/* The wire layout. Field-for-field identical to the ZMK module's struct. */
++struct prospector_adv_data {
++    uint8_t manufacturer_id[2];    /* 0-1   FF FF                          */
++    uint8_t service_uuid[2];       /* 2-3   AB CD                          */
++    uint8_t version;               /* 4     [7:4] major, [3:0] minor       */
++    uint8_t battery_level;         /* 5     0-100 %                        */
++    uint8_t active_layer;          /* 6     0-15                           */
++    uint8_t profile_slot;          /* 7     [6] dev, [5:3] patch, [2:0] pr */
++    uint8_t connection_count;      /* 8     0-5                            */
++    uint8_t status_flags;          /* 9     see PROSPECTOR_FLAG_*          */
++    uint8_t device_role;           /* 10    0 standalone, 1 central, 2 per */
++    uint8_t device_index;          /* 11    split index                    */
++    uint8_t peripheral_battery[3]; /* 12-14 left/right/aux, 0 = N/A        */
++    char    layer_name[4];         /* 15-18 ASCII, not necessarily NUL-str */
++    uint8_t keyboard_id[4];        /* 19-22 HWINFO-derived                 */
++    uint8_t modifier_flags;        /* 23    see PROSPECTOR_MOD_*           */
++    uint8_t wpm_value;             /* 24    0 = inactive/unknown           */
++    uint8_t channel;               /* 25    0 = all                        */
++} __attribute__((packed));
++
++_Static_assert(sizeof(struct prospector_adv_data) == PROSPECTOR_ADV_SIZE,
++               "Prospector payload must be exactly 26 bytes");
++
++/* Semantic input. Every field is either a real measurement or an explicit
++ * "unknown" — the encoder never invents a plausible-looking number. */
++struct prospector_state {
++    uint8_t battery_level;         /* percent; use PROSPECTOR_BATTERY_NONE if unknown */
++    bool    battery_known;
++    uint8_t active_layer;          /* 0-15 */
++    uint8_t profile_slot;          /* Bluetooth host slot 0-4; 0 when wired/2.4G */
++    uint8_t connection_count;      /* connected BLE hosts, 0-5 */
++    uint8_t status_flags;          /* pre-composed from PROSPECTOR_FLAG_* */
++    uint8_t modifier_flags;        /* pre-composed from PROSPECTOR_MOD_* */
++    uint8_t wpm;                   /* 0 when inactive/unknown */
++    uint8_t channel;               /* 0 = all */
++    uint8_t keyboard_id[4];        /* MCU unique ID */
++    /* Layer label. Copied verbatim, truncated to 4, space padded. Passing
++     * NULL yields "L<n>" derived from active_layer (never a guess). */
++    const char *layer_name;
++};
++
++/* Build the wire frame. Returns the number of bytes written (26).
++ * Pure: no globals, no I/O — safe to unit-test and to call from any context. */
++size_t prospector_encode(const struct prospector_state *state,
++                         struct prospector_adv_data     *out);
++
++/* Human-readable dump for debugging (no allocation). */
++void prospector_format(const struct prospector_adv_data *data, char *buf, size_t len);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/keyboards/keychron/common/prospector/prospector_transport.c b/keyboards/keychron/common/prospector/prospector_transport.c
+new file mode 100644
+index 0000000..b24a40d
+--- /dev/null
++++ b/keyboards/keychron/common/prospector/prospector_transport.c
+@@ -0,0 +1,194 @@
++/* Copyright 2026 Keychron
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Prospector status — transport implementations. See prospector_transport.h.
++ */
++
++#include "prospector_transport.h"
++
++#include <string.h>
++
++#include "prospector_status.h"
++
++static uint32_t frames_out;
++static uint32_t frames_dropped;
++
++uint32_t prospector_transport_frames_out(void) { return frames_out; }
++uint32_t prospector_transport_frames_dropped(void) { return frames_dropped; }
++
++size_t prospector_transport_build_ad_element(const uint8_t *payload, size_t len, uint8_t *out) {
++    if (len != PROSPECTOR_ADV_SIZE) return 0;
++
++    out[0] = PROSPECTOR_AD_LEN_FIELD;      /* 27: everything after this byte */
++    out[1] = PROSPECTOR_AD_TYPE_MANUFACTURER;
++    memcpy(&out[2], payload, PROSPECTOR_ADV_SIZE);
++    return PROSPECTOR_AD_ELEMENT_SIZE;
++}
++
++/* ========================================================================== */
++#if defined(PROSPECTOR_TRANSPORT_RAWHID)
++
++#    include "quantum.h"
++#    include "raw_hid.h"
++#    include "keychron_raw_hid.h"
++#    ifdef LK_WIRELESS_ENABLE
++#        include "wireless.h"
++#        include "transport.h"
++#        include "lpm.h" /* usb_power_connected() */
++#    endif
++
++/* Keychron raw HID carries a 32-byte report in both directions, over USB and
++ * over the wireless link (the Launcher web app uses exactly this path in
++ * Bluetooth mode). We use it as a debug/verification carrier:
++ *
++ *   [0]      0xAE   Prospector command group (0xAD is codex_threads')
++ *   [1]      0x01   sub-command: status frame
++ *   [2]      26     payload length
++ *   [3..28]  the 26-byte manufacturer-data payload, verbatim
++ *   [29]     host lock state (not part of the protocol; see below)
++ *   [30..31] zero
++ *
++ * The Prospector v2.2.3 format carries no Caps/Num/Scroll Lock field, so lock
++ * state rides in the spare carrier byte instead of being invented into the
++ * 26-byte frame. Bit 0 = Caps Lock, bit 1 = Num Lock, bit 2 = Scroll Lock.
++ */
++const char *prospector_transport_name(void) { return "rawhid"; }
++
++void prospector_transport_init(void) {}
++
++bool prospector_transport_available(void) { return true; }
++
++void prospector_transport_send(const uint8_t *payload, size_t len, uint8_t aux) {
++    if (len != PROSPECTOR_ADV_SIZE) {
++        frames_dropped++;
++        return;
++    }
++
++    uint8_t report[PROSPECTOR_RAWHID_REPORT_SIZE] = {0};
++    report[0] = PROSPECTOR_RAWHID_CMD;
++    report[1] = PROSPECTOR_RAWHID_SUB;
++    report[2] = (uint8_t)PROSPECTOR_ADV_SIZE;
++
++    /* AD element body goes straight in: the receiver can copy bytes 3..28 into
++     * an advertisement body unchanged. */
++    for (size_t i = 0; i < PROSPECTOR_ADV_SIZE; i++) {
++        report[3 + i] = payload[i];
++    }
++    report[29] = aux;
++
++    uint8_t src = RAW_HID_SRC_USB;
++#    ifdef LK_WIRELESS_ENABLE
++    /* Prefer USB whenever the cable is present.
++     *
++     * Routing on get_transport() alone loses frames: with
++     * KEEP_USB_CONNECTION_IN_WIRELESS_MODE this board keeps the USB HID link
++     * alive even when the mode switch is on Bluetooth or 2.4 GHz, so
++     * get_transport() can report TRANSPORT_WIRELESS while USB is perfectly
++     * usable. kc_raw_hid_send() then takes its wireless branch, which requires
++     * wireless_get_state() == WT_CONNECTED and otherwise *silently drops* the
++     * frame.
++     *
++     * So: USB if the cable is in, otherwise the wireless link. */
++    if (!usb_power_connected() && (get_transport() & TRANSPORT_WIRELESS)) {
++        src = RAW_HID_SRC_WIRELESS;
++    }
++#    endif
++
++    kc_raw_hid_send(src, report, PROSPECTOR_RAWHID_REPORT_SIZE);
++    frames_out++;
++}
++
++/* ========================================================================== */
++#elif defined(PROSPECTOR_TRANSPORT_UART)
++
++#    include "ch.h"
++#    include "hal.h"
++
++/* The STM32F401 hands the finished frame to an external BLE radio over a plain
++ * UART. Frame:
++ *
++ *   [0]      0xAA        sync 0
++ *   [1]      0x55        sync 1
++ *   [2]      0x1B        AD length field
++ *   [3]      0xFF        AD type (manufacturer specific)
++ *   [4..29]  26 bytes    Prospector payload
++ *   [30]     XOR of bytes 2..29
++ *   [31]     0x00        padding, keeps the frame 32 bytes
++ *
++ * The radio firmware only has to forward bytes 2..29 into the advertisement as
++ * one AD element — no parsing of fields, no Prospector knowledge.
++ *
++ * The driver and its pins are the builder's choice; both must be defined:
++ *   -DPROSPECTOR_UART_DRIVER=SD6     (a ChibiOS SerialDriver)
++ * and the matching USART must be enabled in the board's mcuconf.h/halconf.h.
++ */
++#    if !defined(PROSPECTOR_UART_DRIVER)
++#        error "PROSPECTOR_TRANSPORT=uart requires -DPROSPECTOR_UART_DRIVER=<SerialDriver>"
++#    endif
++
++#    ifndef PROSPECTOR_UART_BAUD
++#        define PROSPECTOR_UART_BAUD 115200
++#    endif
++
++static const SerialConfig prospector_uart_cfg = {
++    .speed = PROSPECTOR_UART_BAUD,
++};
++
++const char *prospector_transport_name(void) { return "uart"; }
++
++void prospector_transport_init(void) { sdStart(&PROSPECTOR_UART_DRIVER, &prospector_uart_cfg); }
++
++bool prospector_transport_available(void) { return true; }
++
++void prospector_transport_send(const uint8_t *payload, size_t len, uint8_t aux) {
++    uint8_t frame[PROSPECTOR_UART_FRAME_SIZE] = {0};
++
++    /* Lock state has no home in the UART frame; the radio advertises only the
++     * protocol payload, so nothing is lost that the protocol could carry. */
++    (void)aux;
++
++    if (prospector_transport_build_ad_element(payload, len, &frame[2]) == 0) {
++        frames_dropped++;
++        return;
++    }
++
++    frame[0] = 0xAA;
++    frame[1] = 0x55;
++
++    uint8_t checksum = 0;
++    for (size_t i = 2; i <= PROSPECTOR_AD_ELEMENT_SIZE + 1; i++) {
++        checksum ^= frame[i];
++    }
++    frame[PROSPECTOR_AD_ELEMENT_SIZE + 2] = checksum;
++
++    /* Non-blocking by construction: sdWrite() only blocks when the output queue
++     * is full, and we refuse to call it unless the whole frame fits. */
++    if (oqGetEmptyI(&PROSPECTOR_UART_DRIVER.oqueue) < sizeof(frame)) {
++        frames_dropped++;
++        return;
++    }
++
++    sdWrite(&PROSPECTOR_UART_DRIVER, frame, sizeof(frame));
++    frames_out++;
++}
++
++/* ========================================================================== */
++#else /* PROSPECTOR_TRANSPORT_NONE — the default */
++
++const char *prospector_transport_name(void) { return "none"; }
++
++void prospector_transport_init(void) {}
++
++bool prospector_transport_available(void) { return false; }
++
++/* No backend can carry the frame. It is still counted, so that the encoder and
++ * the scheduler can be validated on hardware without pretending anything was
++ * transmitted. */
++void prospector_transport_send(const uint8_t *payload, size_t len, uint8_t aux) {
++    (void)payload;
++    (void)len;
++    (void)aux;
++    frames_dropped++;
++}
++
++#endif
+diff --git a/keyboards/keychron/common/prospector/prospector_transport.h b/keyboards/keychron/common/prospector/prospector_transport.h
+new file mode 100644
+index 0000000..380a369
+--- /dev/null
++++ b/keyboards/keychron/common/prospector/prospector_transport.h
+@@ -0,0 +1,106 @@
++/* Copyright 2026 Keychron
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Prospector status — transport layer.
++ *
++ * This is the ONLY file that knows how the encoded frame leaves the MCU. The
++ * encoder (prospector_status.c) knows nothing about radios; the state collector
++ * (prospector_qmk.c) knows nothing about wires. Changing transport later means
++ * editing this file alone.
++ *
++ * ---------------------------------------------------------------------------
++ * WHAT "payload" IS
++ * ---------------------------------------------------------------------------
++ * The payload is exactly 26 bytes, and it is the *body* of one BLE advertising
++ * AD structure:
++ *
++ *      [ 0x1B ] [ 0xFF ] [ 26 bytes ]
++ *        length   type     Prospector manufacturer data (begins FF FF AB CD)
++ *
++ * 0xFF is "Manufacturer Specific Data" (BT_DATA_MANUFACTURER_DATA). The Prospector
++ * Scanner's gate is literally:
++ *
++ *      ad_type == BT_DATA_MANUFACTURER_DATA && len >= 26 &&
++ *      data[0..1] == FF FF && data[2..3] == AB CD
++ *
++ * (prospector-zmk-module v2.2.3, src/status_scanner.c). With the 3-byte Flags AD
++ * that is the entire 31-byte budget of a legacy advertising PDU, so a conforming
++ * sender puts this element in the ADV payload and leaves the device name to the
++ * scan response.
++ *
++ * ---------------------------------------------------------------------------
++ * BACKEND SELECTION (from prospector.mk)
++ * ---------------------------------------------------------------------------
++ *   PROSPECTOR_TRANSPORT = none     (default) count frames, send nothing
++ *   PROSPECTOR_TRANSPORT = rawhid            Keychron raw-HID channel, which
++ *                                            works over USB *and* Bluetooth
++ *   PROSPECTOR_TRANSPORT = uart              hand the frame to an external radio
++ *
++ * IMPORTANT — on a stock Keychron K10 Max no backend can put these bytes into a
++ * BLE advertisement. The radio belongs to the LKBT51 module, which this MCU
++ * drives over SPI and which exposes no advertising-data command. `rawhid` is a
++ * verification transport: it proves the on-device state collection and the
++ * encoder against real hardware, over a channel Keychron already provides.
++ * `uart` is what drives an external BLE radio once one is fitted.
++ */
++
++#pragma once
++
++#include <stdint.h>
++#include <stddef.h>
++#include <stdbool.h>
++
++#include "prospector_status.h"
++
++/* AD structure the 26-byte payload must be wrapped in. */
++#define PROSPECTOR_AD_TYPE_MANUFACTURER 0xFF
++#define PROSPECTOR_AD_LEN_FIELD         (PROSPECTOR_ADV_SIZE + 1) /* 27 = len byte value */
++#define PROSPECTOR_AD_ELEMENT_SIZE      (PROSPECTOR_ADV_SIZE + 2) /* 28 = len + type + body */
++
++/* Number of legacy-ADV bytes the element consumes when Flags are present. */
++#define PROSPECTOR_ADV_PDU_USED (PROSPECTOR_AD_ELEMENT_SIZE + 3) /* 31 */
++
++/* Keychron raw-HID report geometry (RAW_EPSIZE). */
++#define PROSPECTOR_RAWHID_REPORT_SIZE 32
++/* Command byte for the Prospector group. The raw-HID command space on this
++ * board is already occupied as follows, so the next genuinely free byte is
++ * 0xAE:
++ *   0x01-0x0B  VIA core (get/set keycode, dynamic keymap, ...)
++ *   0xA0-0xA3  Keychron (protocol version, firmware version, features, layer)
++ *   0xA7-0xAB  Keychron (misc, RGB, analog matrix, wireless DFU, factory test)
++ *   0xAC       local experiment (claude_rgb)
++ *   0xAD       codex_threads "focus slot": 0xAD 0x01 <slot 1..12>
++ * 0xAD in particular is a *shipped* keyboard-to-host channel on this board, so
++ * squatting on it would mix two unrelated producers into one namespace. */
++#define PROSPECTOR_RAWHID_CMD  0xAE
++#define PROSPECTOR_RAWHID_SUB  0x01
++
++/* UART framing: [AA][55][AD element...][XOR]. Self-syncing, fixed length. */
++#define PROSPECTOR_UART_FRAME_SIZE (PROSPECTOR_AD_ELEMENT_SIZE + 4) /* 32 */
++
++/* One-time setup. Safe to call when the backend needs no setup. */
++void prospector_transport_init(void);
++
++/* Hand one encoded 26-byte frame to the backend. Never blocks: if the backend
++ * cannot accept the frame right now the frame is dropped and counted.
++ *
++ * `aux` is transport-private and is NOT part of the Prospector protocol. The
++ * v2.2.3 wire format has no Caps/Num/Scroll Lock field, so we attach host lock
++ * state to the raw-HID verification carrier (report byte 29) where a host tool
++ * can read it without corrupting the protocol frame. Backends that have no room
++ * for it ignore the argument. */
++void prospector_transport_send(const uint8_t *payload, size_t len, uint8_t aux);
++
++/* True when the backend can currently carry a frame. */
++bool prospector_transport_available(void);
++
++/* Backend name, for logs. */
++const char *prospector_transport_name(void);
++
++/* Diagnostics. */
++uint32_t prospector_transport_frames_out(void);
++uint32_t prospector_transport_frames_dropped(void);
++
++/* Build the 28-byte AD element (len, type, payload) in `out`.
++ * Shared by every backend that needs the framed form; pure, testable. */
++size_t prospector_transport_build_ad_element(const uint8_t *payload, size_t len, uint8_t *out);
+diff --git a/keyboards/keychron/common/wireless/wireless.c b/keyboards/keychron/common/wireless/wireless.c
+index 38e9b22..05c3964 100644
+--- a/keyboards/keychron/common/wireless/wireless.c
++++ b/keyboards/keychron/common/wireless/wireless.c
+@@ -591,6 +591,12 @@ wt_state_t wireless_get_state(void) {
+     return wireless_state;
+ };
+ 
++/* Additive accessor for the Prospector status feature: the active Bluetooth
++ * host slot is otherwise file-static. Read-only; no behaviour change. */
++uint8_t wireless_get_host_index(void) {
++    return host_index;
++}
++
+ bool process_record_wireless(uint16_t keycode, keyrecord_t *record) {
+     if (get_transport() & TRANSPORT_WIRELESS) {
+         lpm_timer_reset();
+diff --git a/keyboards/keychron/common/wireless/wireless.h b/keyboards/keychron/common/wireless/wireless.h
+index a50b3f2..b031e03 100644
+--- a/keyboards/keychron/common/wireless/wireless.h
++++ b/keyboards/keychron/common/wireless/wireless.h
+@@ -106,6 +106,9 @@ void send_string_task(void);
+ 
+ wt_state_t wireless_get_state(void);
+ 
++/* Additive accessor for the Prospector status feature (see wireless.c). */
++uint8_t wireless_get_host_index(void);
++
+ void wireless_low_battery_shutdown(void);
+ 
+ bool process_record_wireless(uint16_t keycode, keyrecord_t *record);
+diff --git a/keyboards/keychron/k10_max/ansi/rgb/keymaps/keychron/rules.mk b/keyboards/keychron/k10_max/ansi/rgb/keymaps/keychron/rules.mk
+index 1e5b998..6e191d6 100644
+--- a/keyboards/keychron/k10_max/ansi/rgb/keymaps/keychron/rules.mk
++++ b/keyboards/keychron/k10_max/ansi/rgb/keymaps/keychron/rules.mk
+@@ -1 +1,17 @@
+ VIA_ENABLE = yes
++
++# --- Prospector status -------------------------------------------------------
++# Delete or comment out the block below and this keymap builds the stock
++# Keychron firmware unchanged.
++PROSPECTOR_ENABLE = yes
++# Verify the pipeline over the Keychron raw-HID channel (USB and Bluetooth).
++# Use "none" to compile the collector without any carrier, or "uart" once an
++# external BLE radio is fitted.
++PROSPECTOR_TRANSPORT = rawhid
++# PROSPECTOR_DEBUG = yes
++
++# Real inputs for the status frame.
++WPM_ENABLE = yes
++CAPS_WORD_ENABLE = yes
++
++include keyboards/keychron/common/prospector/prospector.mk
+diff --git a/keyboards/keychron/k10_max/halconf.h b/keyboards/keychron/k10_max/halconf.h
+index f4f239a..a93dca6 100644
+--- a/keyboards/keychron/k10_max/halconf.h
++++ b/keyboards/keychron/k10_max/halconf.h
+@@ -20,6 +20,15 @@
+ 
+ #define HAL_USE_SPI TRUE
+ 
++/* Prospector UART transport: the encoded status frame is handed to an external
++ * BLE radio over a UART. Enabled only when that transport is selected, so a
++ * stock build is unaffected. */
++#ifdef PROSPECTOR_TRANSPORT_UART
++#    ifndef HAL_USE_SERIAL
++#        define HAL_USE_SERIAL TRUE
++#    endif
++#endif
++
+ #ifdef LK_WIRELESS_ENABLE
+ #    define HAL_USE_RTC TRUE
+ #    define PAL_USE_CALLBACKS TRUE
+diff --git a/keyboards/keychron/k10_max/k10_max.c b/keyboards/keychron/k10_max/k10_max.c
+index 20046af..246ae6b 100644
+--- a/keyboards/keychron/k10_max/k10_max.c
++++ b/keyboards/keychron/k10_max/k10_max.c
+@@ -16,6 +16,10 @@
+ 
+ #include "keychron.h"
+ 
++#ifdef PROSPECTOR_ENABLE
++#    include "prospector_qmk.h"
++#endif
++
+ #define POWER_ON_LED_DURATION 3000
+ static uint32_t power_on_indicator_timer;
+ 
+@@ -36,6 +40,9 @@ void keyboard_post_init_kb(void) {
+     keychron_common_init();
+     keyboard_post_init_user();
+     power_on_indicator_timer = timer_read32();
++#ifdef PROSPECTOR_ENABLE
++    prospector_status_init();
++#endif
+ }
+ 
+ void keychron_task_kb(void) {
+@@ -73,6 +80,12 @@ void keychron_task_kb(void) {
+         if (host_keyboard_led_state().num_lock) gpio_write_pin(LED_NUM_LOCK_PIN, LED_PIN_ON_STATE);
+     }
+ #endif
++
++#ifdef PROSPECTOR_ENABLE
++    /* Timer-driven only: never blocks, never waits, and does nothing at all
++     * when the module is built out. */
++    prospector_status_task();
++#endif
+ }
+ 
+ #ifdef LK_WIRELESS_ENABLE
+diff --git a/keyboards/keychron/k10_max/mcuconf.h b/keyboards/keychron/k10_max/mcuconf.h
+index 9a2b660..1ab22ad 100644
+--- a/keyboards/keychron/k10_max/mcuconf.h
++++ b/keyboards/keychron/k10_max/mcuconf.h
+@@ -35,3 +35,12 @@
+ 
+ #undef STM32_SPI_USE_SPI1
+ #define STM32_SPI_USE_SPI1 TRUE
++
++/* Prospector UART transport. USART6 is the one the K10 Max leaves free: it
++ * needs PA11/PA12, and every other USART pin on this package is already used by
++ * the matrix or by the wireless module (SPI1 = PA5/PA6/PA7 on the same port).
++ * Only enabled when the UART transport is selected. */
++#ifdef PROSPECTOR_TRANSPORT_UART
++#    undef STM32_SERIAL_USE_USART6
++#    define STM32_SERIAL_USE_USART6 TRUE
++#endif

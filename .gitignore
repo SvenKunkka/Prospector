@@ -1,0 +1,9 @@
+# Images of the keyboard's own firmware — not this work, and not distributed here.
+#
+# `k10max_FACTORY_original_256k.bin` is a dump of this board's factory flash and
+# `k10max_STOCK_rollback.bin` is the vendor stock image used to roll a flash back.
+# Both are Keychron's. Their SHA-256 are recorded in README.md so an image obtained
+# from the vendor (or dumped from your own board) can be checked against the ones
+# this work used. The files stay in the working tree so a flash can still be undone.
+firmware/k10max_FACTORY_original_256k.bin
+firmware/k10max_STOCK_rollback.bin

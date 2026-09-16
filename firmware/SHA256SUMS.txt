@@ -1,0 +1,2 @@
+176a5c01f766b53400d5612bcab8593d3e96e2bbc344cd4d11b6b26417a8b6a5  firmware/k10max_prospector_rawhid.bin
+84b2749d30543ab79b08716da630db71e150e14b5360bd74c715ca1e17674d21  firmware/k10max_prospector_rawhid.hex
