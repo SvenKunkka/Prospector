@@ -1,3 +1,7 @@
+<!-- SVENKUNKKA-README-NAV:BEGIN -->
+[中文项目说明](#project-overview-zh) · [English overview](#project-overview-en) · [维护者 X / Maintainer on X](https://x.com/Svenu1s5)
+<!-- SVENKUNKKA-README-NAV:END -->
+
 # K10 Max → Prospector
 
 Making a **Keychron K10 Max** drive a **Prospector** status display, and the
@@ -109,3 +113,30 @@ stock firmware — can be checked against the ones this work used:
 `firmware/SHA256SUMS.txt` lists only the images that are present here. The two above
 stay in the working tree on the machine that did the work, so a flash can still be
 undone; they are simply not published.
+
+
+---
+
+<!-- SVENKUNKKA-PROJECT-INFO:BEGIN -->
+
+<a id="project-overview-zh"></a>
+## 中文项目说明
+
+研究 Keychron K10 Max 与 Prospector 状态屏连接方式的项目，包含键盘侧补丁、协议编码、主机一致性测试和 Raw HID 状态接收工具。重点说明原装无线模块的广播能力边界。
+
+**使用入口：** 先读 [技术结论](docs/PROSPECTOR.md)；运行 `tests/run.sh` 做主机协议检查，设备相关操作另见 [固件说明](docs/FLASHING.md)。
+
+**范围说明：** 原装 LKBT51 无法发出 Prospector 所需广播；USB 状态帧验证不能证明 BLE 显示联通，UART 方案仍需要外接无线硬件。
+
+<a id="project-overview-en"></a>
+## English project overview
+
+A project investigating the connection between a Keychron K10 Max and a Prospector status display, with keyboard patches, protocol encoding, host conformance tests and a Raw HID receiver. It documents the advertising limits of the stock radio.
+
+**Getting started:** Read the [technical conclusion](docs/PROSPECTOR.md), run `tests/run.sh` for host protocol checks, and consult the [firmware guide](docs/FLASHING.md) before device operations.
+
+**Scope:** The stock LKBT51 cannot emit the required Prospector advertisement. USB frame checks do not establish BLE display connectivity; the UART route needs additional radio hardware.
+
+**仓库维护者 / Repository maintainer:** [SvenKunkka](https://github.com/SvenKunkka) · [X / Twitter](https://x.com/Svenu1s5)
+
+<!-- SVENKUNKKA-PROJECT-INFO:END -->
